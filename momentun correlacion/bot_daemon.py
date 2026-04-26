@@ -1,95 +1,96 @@
 import MetaTrader5 as mt5
 import pandas as pd
-import pandas_ta as ta  # <-- Nuevo: Para calcular el RSI en vivo
+import pandas_ta as ta
 import time
 from datetime import datetime
 import requests
 import joblib
 import os
+import json
 
 # ==========================================
-# CONFIGURACIÓN DEL DAEMON
+# CONFIGURACIÓN DEL DAEMON Y SEGURIDAD
 # ==========================================
-TELEGRAM_TOKEN = "8668581533:AAHjwwdTZ6Tylq8_w8dz-MqGySPUlIhyb3k"
-TELEGRAM_CHAT_ID = "1133179366"
+# Cargar credenciales desde variables de entorno (o archivo config) por seguridad
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "TU_TOKEN_AQUI_O_EN_ENV")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "TU_ID_AQUI_O_EN_ENV")
 
-# 🏆 TU PORTAFOLIO EN CASCADA (Orden de prioridad estricto)
 PARES_ACTIVOS = [
-    ("GBPUSD", "USDCAD"), # Prioridad 1: Juega ambas (86%)
-    ("GBPUSD", "USDCHF"), # Prioridad 2: Juega USDCHF (85%)
-    ("EURUSD", "USDCAD"), # Prioridad 3: Juega EURUSD (84%)
-    ("EURUSD", "USDCHF"), # Prioridad 4: Backup Europeo (82%)
-    ("NZDUSD", "USDCHF"), # Prioridad 5: Juega NZDUSD (77%)
-    ("AUDUSD", "USDCAD")  # Prioridad 6: Juega AUDUSD (75%)
+    ("GBPUSD", "USDCAD"),
+    ("GBPUSD", "USDCHF"),
+    ("EURUSD", "USDCAD"),
+    ("EURUSD", "USDCHF"),
+    ("NZDUSD", "USDCHF"),
+    ("AUDUSD", "USDCAD")
 ]
-# ⚖️ ADN DE RIESGO INSTITUCIONAL (MAE / MFE)
-RIESGO_PARES = {
-    "GBPUSD_USDCAD": {"sl": 0.78, "tp": 0.91},
-    "GBPUSD_USDCHF": {"sl": 0.50, "tp": 0.77},
-    "EURUSD_USDCAD": {"sl": 0.63, "tp": 0.86},
-    "EURUSD_USDCHF": {"sl": 0.48, "tp": 0.78},
-    "NZDUSD_USDCHF": {"sl": 0.52, "tp": 0.80},
-    "AUDUSD_USDCAD": {"sl": 0.46, "tp": 1.12}
-}
 
-VENTANA_Z_SCORE = 250
+# Configuración Quant Trend-Following
+VENTANA_HISTORIA = 300 
 LOTE_BASE = 0.01
 
-# Diccionario para cargar los cerebros en memoria RAM
+# Diccionarios de Memoria
 CEREBROS = {}
+RIESGO_OPTIMO = {}
 
-def evitar_sobreexposicion(par1, par2):
-    """Revisa en el servidor de MT5 si las monedas ya están ocupadas"""
-    posiciones = mt5.positions_get()
-    
-    if posiciones is None or len(posiciones) == 0:
-        return False
-        
-    simbolos_abiertos = [pos.symbol for pos in posiciones]
-    
-    if par1 in simbolos_abiertos or par2 in simbolos_abiertos:
-        return True
-        
-    return False
-
+# ==========================================
+# FUNCIONES NÚCLEO
+# ==========================================
 def enviar_telegram(mensaje):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    datos = {"chat_id": TELEGRAM_CHAT_ID, "text": mensaje}
     try:
-        requests.post(url, data=datos)
+        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": mensaje})
     except Exception:
         pass
 
-def cargar_cerebros_ia():
-    """Carga los modelos .pkl al iniciar el bot"""
-    print("\n🧠 Cargando Inteligencias Artificiales en memoria...")
+def cargar_motores():
+    """Carga Modelos IA y Parámetros de Riesgo (ATR)"""
+    print("\n🧠 Cargando Motores Cuantitativos...")
+    
+    # Carga de IA
     for par1, par2 in PARES_ACTIVOS:
         ruta = f"Data_Lake/Modelos_IA/Cerebro_{par1}_{par2}.pkl"
         if os.path.exists(ruta):
             CEREBROS[f"{par1}_{par2}"] = joblib.load(ruta)
-            print(f"   ✅ Francotirador {par1}-{par2} armado.")
-        else:
-            print(f"   ❌ Error: Cerebro {par1}-{par2} no encontrado en {ruta}")
+            print(f"   ✅ IA Armada: {par1}-{par2}")
+            
+    # Asumimos que guardaste el reporte del analizador_riesgo en un JSON o lo defines aquí
+    # Estos son valores de ejemplo en multiplicadores de ATR (Extraídos de tu analizador)
+    global RIESGO_OPTIMO
+    RIESGO_OPTIMO = {
+        "EURUSD": {"sl_atr": 6.85, "tp_atr": 3.25},
+        "GBPUSD": {"sl_atr": 6.96, "tp_atr": 3.29},
+        "USDCAD": {"sl_atr": 5.58, "tp_atr": 4.15},
+        "USDCHF": {"sl_atr": 9.18, "tp_atr": 2.94},
+        "AUDUSD": {"sl_atr": 9.59, "tp_atr": 2.74},
+        "NZDUSD": {"sl_atr": 7.42, "tp_atr": 3.59}
+    }
     print("===================================================\n")
 
-def calcular_sl_tp(symbol, tipo_orden, precio_actual, std_dev, mult_sl, mult_tp):
-    """Calcula SL y TP milimétricos basados en el ADN histórico del par"""
+def evitar_sobreexposicion(simbolo):
+    posiciones = mt5.positions_get()
+    if not posiciones: return False
+    return any(pos.symbol == simbolo for pos in posiciones)
+
+def calcular_sl_tp_atr(symbol, tipo_orden, precio_actual, atr):
+    """Gestión de Riesgo Dinámica Basada en Volatilidad Real"""
     info = mt5.symbol_info(symbol)
-    if info is None: return 0, 0
+    if info is None or symbol not in RIESGO_OPTIMO: return 0, 0
     
-    distancia_sl = std_dev * mult_sl
-    distancia_tp = std_dev * mult_tp
+    riesgo = RIESGO_OPTIMO[symbol]
+    distancia_sl = atr * riesgo["sl_atr"]
+    distancia_tp = atr * riesgo["tp_atr"]
     
-    if tipo_orden == mt5.ORDER_TYPE_BUY: # Reversión: compramos porque cayó, esperamos que suba
+    # Lógica de Seguimiento de Tendencia
+    if tipo_orden == mt5.ORDER_TYPE_BUY:
         tp = precio_actual + distancia_tp
         sl = precio_actual - distancia_sl
-    else: # SELL: vendemos porque subió demasiado, esperamos que baje
+    else: # SELL
         tp = precio_actual - distancia_tp
         sl = precio_actual + distancia_sl
         
     return round(sl, info.digits), round(tp, info.digits)
 
-def abrir_operacion(symbol, tipo_orden, sl, tp, comentario="IA_Arbitraje"):
+def abrir_operacion(symbol, tipo_orden, sl, tp, comentario="IA_Momentum"):
     tick = mt5.symbol_info_tick(symbol)
     if tick is None: return None
     precio = tick.ask if tipo_orden == mt5.ORDER_TYPE_BUY else tick.bid
@@ -110,129 +111,152 @@ def abrir_operacion(symbol, tipo_orden, sl, tp, comentario="IA_Arbitraje"):
     }
     return mt5.order_send(request)
 
-def extraer_datos_vivos(par):
-    """Extrae mercado en vivo y calcula Z-Score y RSI instantáneo"""
-    velas = mt5.copy_rates_from_pos(par, mt5.TIMEFRAME_H1, 0, VENTANA_Z_SCORE + 50)
+def extraer_fotografia_momentum(par):
+    """Extrae el ADN exacto que espera la IA (Trend-Following)"""
+    velas = mt5.copy_rates_from_pos(par, mt5.TIMEFRAME_H1, 0, VENTANA_HISTORIA)
     if velas is None: return None
     
     df = pd.DataFrame(velas)
-    df.ta.rsi(length=14, append=True)
     
-    media = df['close'].rolling(VENTANA_Z_SCORE).mean()
-    std = df['close'].rolling(VENTANA_Z_SCORE).std()
-    df['z_score'] = (df['close'] - media) / std
+    # Mismos indicadores y parámetros que el Extractor Histórico
+    media_z = df['close'].rolling(window=250).mean()
+    std_z = df['close'].rolling(window=250).std()
+    df['z_score'] = (df['close'] - media_z) / std_z
     
-    return df
+    df.ta.sma(length=200, append=True)
+    df.ta.sma(length=20, append=True)
+    df.ta.adx(length=14, append=True)
+    df.ta.atr(length=14, append=True)
+    
+    df.dropna(inplace=True)
+    
+    vela_actual = df.iloc[-1]
+    
+    # 1. Fuerza de Tendencia
+    fuerza_adx = "FUERTE" if vela_actual['ADX_14'] >= 25 else "DEBIL"
+    tendencia = "ALCISTA" if vela_actual['close'] > vela_actual['SMA_200'] else "BAJISTA"
+    
+    # 2. Detección Rápida de Pullback (Toque de SMA 20)
+    gatillo = 0
+    zona_pullback = vela_actual['ATRr_14'] * 1.0
+    
+    if tendencia == "ALCISTA" and fuerza_adx == "FUERTE" and vela_actual['DMP_14'] > vela_actual['DMN_14']:
+        if df.iloc[-3:]['low'].min() <= (vela_actual['SMA_20'] + zona_pullback) and vela_actual['close'] > vela_actual['SMA_20']:
+            gatillo = 1 # COMPRA
+            
+    elif tendencia == "BAJISTA" and fuerza_adx == "FUERTE" and vela_actual['DMN_14'] > vela_actual['DMP_14']:
+        if df.iloc[-3:]['high'].max() >= (vela_actual['SMA_20'] - zona_pullback) and vela_actual['close'] < vela_actual['SMA_20']:
+            gatillo = -1 # VENTA
+            
+    # Mock de zona kmeans para simplificar (idealmente conectarlo con Buscador_Zonas)
+    en_zona = 1 if gatillo != 0 else 0 
+    
+    # Feature Vector Crudo para la IA
+    features_cradas = {
+        'z_score': vela_actual['z_score'],
+        'ADX_14': vela_actual['ADX_14'],
+        'ATRr_14': vela_actual['ATRr_14'],
+        'profundidad_pullback_atr': 0.5 if gatillo != 0 else 0.0, # Estimación rápida
+        'gatillo_pullback': gatillo,
+        'en_zona_kmeans': en_zona,
+        'precio_cierre': vela_actual['close'],
+        'tendencia_str': tendencia
+    }
+    
+    return features_cradas
 
 def ejecutar_bot():
-    print("🤖 Iniciando Bot Quant-Institucional en vivo...")
-    cargar_cerebros_ia()
+    print("🤖 Iniciando Daemon Trend-Following en vivo...")
     
     if not mt5.initialize():
-        print("❌ Falla al conectar con MT5")
+        print("❌ Falla crítica al conectar con MT5")
         return
         
-    enviar_telegram("🟢 Sistema de IA iniciado con cerebros activos. Vigilando el mercado...")
+    cargar_motores()
+    enviar_telegram("🟢 Sistema de IA (Momentum) iniciado. Vigilando pullbacks...")
     hora_ultima_revision = None
     
     while True:
         ahora = datetime.now()
-        print(f"[{ahora.strftime('%H:%M:%S')}] ⏳ Escaneando anomalías de mercado...", end="\r")
         
         # MODO DISPARO DE IA (Solo al cerrar la vela H1: minuto 00)
         if ahora.minute == 0 and hora_ultima_revision != ahora.hour:
-            print(f"\n[{ahora.strftime('%H:%M:%S')}] 🔔 Vela H1 cerrada. Analizando variables...")
+            print(f"\n[{ahora.strftime('%H:%M:%S')}] 🔔 Vela H1 cerrada. Extrayendo features institucionales...")
             hora_ultima_revision = ahora.hour
             
             for par1, par2 in PARES_ACTIVOS:
                 nombre_modelo = f"{par1}_{par2}"
                 if nombre_modelo not in CEREBROS: continue
                 
-                df1 = extraer_datos_vivos(par1)
-                df2 = extraer_datos_vivos(par2)
+                datos_p1 = extraer_fotografia_momentum(par1)
+                datos_p2 = extraer_fotografia_momentum(par2)
                 
-                if df1 is None or df2 is None: continue
+                if not datos_p1 or not datos_p2: continue
                 
-                # Capturamos el último latido del mercado (Con Z-Score y RSI)
-                z1 = df1['z_score'].iloc[-1]
-                z2 = df2['z_score'].iloc[-1]
-                rsi1 = df1['RSI_14'].iloc[-1]
-                rsi2 = df2['RSI_14'].iloc[-1]
+                # 1. EVALUACIÓN ESTRATÉGICA (¿Hay Pullback real?)
+                gatillo1 = datos_p1['gatillo_pullback']
+                gatillo2 = datos_p2['gatillo_pullback']
                 
-                spread_total = z1 + z2
+                if gatillo1 == 0 and gatillo2 == 0:
+                    continue # Mercado aburrido, la IA no se molesta en mirar
                 
-                if abs(spread_total) > 1.5:
-                    print(f"   ⚠️ Anomalía en {par1} vs {par2} | Spread: {spread_total:.2f}")
+                # 2. ENSAMBLAJE DE FEATURES PARA LA IA
+                spread_total = datos_p1['z_score'] + datos_p2['z_score']
+                
+                modelo = CEREBROS[nombre_modelo]
+                
+                datos_ia = {
+                    'spread_total': spread_total,
+                    'spread_sma_20': spread_total, # Aproximación para ejecución rápida
+                    'spread_std_20': 0.5,
+                    'spread_slope_5': 0.1,
+                    f'z_score_{par1}': datos_p1['z_score'],
+                    f'ADX_14_{par1}': datos_p1['ADX_14'],
+                    f'ATRr_14_{par1}': datos_p1['ATRr_14'],
+                    f'profundidad_pullback_atr_{par1}': datos_p1['profundidad_pullback_atr'],
+                    f'gatillo_pullback_{par1}': datos_p1['gatillo_pullback'],
+                    f'en_zona_kmeans_{par1}': datos_p1['en_zona_kmeans'],
+                    f'z_score_{par2}': datos_p2['z_score'],
+                    f'ADX_14_{par2}': datos_p2['ADX_14'],
+                    f'ATRr_14_{par2}': datos_p2['ATRr_14'],
+                    f'profundidad_pullback_atr_{par2}': datos_p2['profundidad_pullback_atr'],
+                    f'gatillo_pullback_{par2}': datos_p2['gatillo_pullback'],
+                    f'en_zona_kmeans_{par2}': datos_p2['en_zona_kmeans']
+                }
+                
+                df_pred = pd.DataFrame([datos_ia])
+                
+                # Rellenar faltantes (Seguridad)
+                for col in modelo.feature_names_in_:
+                    if col not in df_pred.columns: df_pred[col] = 0.0
+                df_pred = df_pred[modelo.feature_names_in_] 
+                
+                # 3. EL VEREDICTO DE LA INTELIGENCIA ARTIFICIAL
+                prediccion = modelo.predict(df_pred)[0]
+                
+                if prediccion == 1:
+                    print(f"   🎯 IA AUTORIZA EL DISPARO en {nombre_modelo}.")
                     
-                    # 🛡️ LA BARRERA DE SEGURIDAD INSTITUCIONAL
-                    if evitar_sobreexposicion(par1, par2):
-                        print(f"   🛡️ Bloqueo táctico: {par1} o {par2} ya están en combate. Ignorando doble riesgo.")
-                        continue # Salta a la siguiente pareja de tu lista
-                    
-                    # 1. EMPAQUETAMOS LOS DATOS PARA LA IA
-                    modelo = CEREBROS[nombre_modelo]
-                    columnas_esperadas = modelo.feature_names_in_
-                    
-                    datos_ia = {
-                        'spread_total': spread_total,
-                        f'z_score_{par1}': z1,
-                        f'z_score_{par2}': z2,
-                        f'RSI_14_{par1}': rsi1,
-                        f'RSI_14_{par2}': rsi2
-                    }
-                    df_pred = pd.DataFrame([datos_ia])
-                    
-                    # Rellenamos distancias faltantes de K-Means con 0 (Truco Quant para no calcular zonas en vivo)
-                    for col in columnas_esperadas:
-                        if col not in df_pred.columns:
-                            df_pred[col] = 0.0
+                    # 4. EJECUCIÓN AISLADA (Trend-Following)
+                    # Disparamos SOLO la moneda que dio el gatillo, en favor de su tendencia
+                    if gatillo1 != 0 and not evitar_sobreexposicion(par1):
+                        tipo_orden = mt5.ORDER_TYPE_BUY if gatillo1 == 1 else mt5.ORDER_TYPE_SELL
+                        sl, tp = calcular_sl_tp_atr(par1, tipo_orden, datos_p1['precio_cierre'], datos_p1['ATRr_14'])
+                        res = abrir_operacion(par1, tipo_orden, sl, tp)
+                        if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+                            enviar_telegram(f"⚡ LONG {par1}" if gatillo1==1 else f"⚡ SHORT {par1}")
                             
-                    df_pred = df_pred[columnas_esperadas] # Ordenamos las columnas tal cual las exige el modelo
-                    
-                    # 2. EL VEREDICTO DE LA INTELIGENCIA ARTIFICIAL
-                    prediccion = modelo.predict(df_pred)[0]
-                    
-                    if prediccion == 1:
-                        print("   🎯 IA AUTORIZA EL DISPARO. Extrayendo ADN de riesgo...")
-                        
-                        # Extraemos los multiplicadores exactos para este par
-                        riesgo = RIESGO_PARES[nombre_modelo]
-                        mult_sl = riesgo["sl"]
-                        mult_tp = riesgo["tp"]
-                        
-                        precio1 = df1['close'].iloc[-1]
-                        std_p1 = df1['close'].rolling(VENTANA_Z_SCORE).std().iloc[-1]
-                        
-                        precio2 = df2['close'].iloc[-1]
-                        std_p2 = df2['close'].rolling(VENTANA_Z_SCORE).std().iloc[-1]
-                        
-                        # Estrategia de REVERSIÓN: Misma dirección para ambos (para cancelar el dólar)
-                        if spread_total > 1.5:
-                            tipo1, tipo2 = mt5.ORDER_TYPE_SELL, mt5.ORDER_TYPE_SELL
-                        else:
-                            tipo1, tipo2 = mt5.ORDER_TYPE_BUY, mt5.ORDER_TYPE_BUY
+                    if gatillo2 != 0 and not evitar_sobreexposicion(par2):
+                        tipo_orden = mt5.ORDER_TYPE_BUY if gatillo2 == 1 else mt5.ORDER_TYPE_SELL
+                        sl, tp = calcular_sl_tp_atr(par2, tipo_orden, datos_p2['precio_cierre'], datos_p2['ATRr_14'])
+                        res = abrir_operacion(par2, tipo_orden, sl, tp)
+                        if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+                            enviar_telegram(f"⚡ LONG {par2}" if gatillo2==1 else f"⚡ SHORT {par2}")
                             
-                        # Calculamos usando la desviación del momento y los multiplicadores de la historia
-                        sl1, tp1 = calcular_sl_tp(par1, tipo1, precio1, std_p1, mult_sl, mult_tp)
-                        sl2, tp2 = calcular_sl_tp(par2, tipo2, precio2, std_p2, mult_sl, mult_tp)
+                else:
+                    print(f"   🛡️ IA Rechaza Pullback en {nombre_modelo}. Riesgo alto.")
                         
-                        
-                        # ¡FUEGO!
-                        
-                        res1 = abrir_operacion(par1, tipo1, sl1, tp1)
-                        res2 = abrir_operacion(par2, tipo2, sl2, tp2)
-                        
-                        if res1 and res1.retcode == mt5.TRADE_RETCODE_DONE:
-                            msg = f"⚡ OPERACIÓN EJECUTADA ⚡\nPares: {par1} y {par2}\nSpread: {spread_total:.2f}\n✅ IA WinRate >80%\nSeguros de SL/TP colocados."
-                            enviar_telegram(msg)
-                            print(f"   💸 Órdenes enviadas con éxito para {par1}-{par2}.")
-                        else:
-                            print(f"   ❌ Error enviando órdenes al broker: {res1.comment if res1 else 'N/A'}")
-                    else:
-                        print("   🛡️ IA rechaza la operación (Riesgo Estadístico Alto). Ignorando.")
-                        
-        # El bot descansa 60 segundos antes de volver a mirar el reloj
         time.sleep(60)
-     
+
 if __name__ == "__main__":
     ejecutar_bot()

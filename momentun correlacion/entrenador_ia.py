@@ -1,7 +1,8 @@
 import pandas as pd
-from sklearn.model_selection import train_test_split
+import numpy as np
+from sklearn.model_selection import TimeSeriesSplit
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, classification_report # Restaurado
+from sklearn.metrics import classification_report, precision_score
 import joblib
 import os
 
@@ -9,51 +10,99 @@ def entrenar_modelo(df_entrenamiento, par1, par2):
     if not os.path.exists("Data_Lake/Modelos_IA"):
         os.makedirs("Data_Lake/Modelos_IA")
 
-    columnas_z_score = [col for col in df_entrenamiento.columns if 'z_score' in col]
-    columnas_distancias = [col for col in df_entrenamiento.columns if 'distancia' in col]
-    columnas_rsi = [col for col in df_entrenamiento.columns if 'RSI' in col]
+    df = df_entrenamiento.copy()
+
+    # ==========================================
+    # 1. ENRIQUECIMIENTO DEL SPREAD (Punto 5)
+    # ==========================================
+    # Ya no le damos solo el spread crudo, le damos su contexto dinámico
+    df['spread_sma_20'] = df['spread_total'].rolling(20).mean()
+    df['spread_std_20'] = df['spread_total'].rolling(20).std()
+    df['spread_slope_5'] = df['spread_total'] - df['spread_total'].shift(5) # Pendiente
     
-    features = ['spread_total'] + columnas_z_score + columnas_distancias + columnas_rsi
-    df_limpio = df_entrenamiento.dropna(subset=features).copy()
+    df.dropna(inplace=True)
+    df.reset_index(drop=True, inplace=True)
+
+    # ==========================================
+    # 2. SELECCIÓN DE FEATURES 
+    # ==========================================
+    features = ['spread_total', 'spread_sma_20', 'spread_std_20', 'spread_slope_5']
     
-    if len(df_limpio) < 200:
-        print(f"   ⚠️ Pocos datos etiquetados ({len(df_limpio)}). Se omite el entrenamiento.")
+    variables_base = [
+        'z_score', 'ADX_14', 'ATRr_14', 
+        'profundidad_pullback_atr', 'gatillo_pullback', 'en_zona_kmeans'
+    ]
+    
+    for var in variables_base:
+        col_p1 = f"{var}_{par1}"
+        col_p2 = f"{var}_{par2}"
+        if col_p1 in df.columns: features.append(col_p1)
+        if col_p2 in df.columns: features.append(col_p2)
+
+    if len(df) < 500:
+        print(f"   ⚠️ Pocos datos para Walk-Forward ({len(df)}). Se omite el entrenamiento.")
         return None
 
-    X = df_limpio[features]
-    y = df_limpio['target_exito']
-
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, shuffle=False)
-
-    modelo = RandomForestClassifier(n_estimators=200, max_depth=10, random_state=42, class_weight='balanced')
-    modelo.fit(X_train, y_train)
-
-    predicciones = modelo.predict(X_test)
-    precision_global = accuracy_score(y_test, predicciones) * 100
+    X = df[features]
+    y = df['target_exito']
 
     # ==========================================
-    # EL TABLERO DE CONTROL (Restaurado)
+    # 3. VALIDACIÓN WALK-FORWARD + EMBARGO (Puntos 3 y 6)
     # ==========================================
-    print(f"\n   📊 REPORTE DEL CEREBRO: {par1} vs {par2}")
-    print("   " + "="*45)
+    # Dividimos la historia en 5 bloques de tiempo progresivos
+    tscv = TimeSeriesSplit(n_splits=5)
     
-    # Reporte detallado (Precision, Recall, F1)
-    reporte = classification_report(y_test, predicciones, target_names=["Perdedoras (0)", "Ganadoras (1)"])
-    for linea in reporte.split('\n'):
-        print(f"   {linea}")
+    # Reducimos max_depth para evitar sobreajuste (Overfitting)
+    modelo = RandomForestClassifier(n_estimators=200, max_depth=7, random_state=42, class_weight='balanced')
+    
+    print(f"\n   ⚙️ Evaluando con Walk-Forward (5 Folds) para {par1}-{par2}...")
+    
+    precisiones_historicas = []
+    
+    for train_index, test_index in tscv.split(X):
+        # EMBARGO: Eliminamos las últimas 24 velas del set de entrenamiento
+        # para que no haya fuga de datos hacia el futuro del set de prueba.
+        embargo = 24 
+        if len(train_index) > embargo:
+            train_index = train_index[:-embargo]
+            
+        X_train, X_test = X.iloc[train_index], X.iloc[test_index]
+        y_train, y_test = y.iloc[train_index], y.iloc[test_index]
+        
+        # Entrenamos en el pasado, predecimos en el futuro iterativo
+        modelo.fit(X_train, y_train)
+        preds = modelo.predict(X_test)
+        
+        # Métrica de Trading (Punto 4): Nos importa la PRECISION (Cuando dice dispara, ¿gana?)
+        if sum(preds) > 0:
+            prec = precision_score(y_test, preds, zero_division=0)
+            precisiones_historicas.append(prec)
 
-    # Top 3 de variables que mira la IA
-    print("   🕵️‍♂️ TOP 3 VARIABLES CLAVE:")
-    importancias = modelo.feature_importances_
-    pesos = pd.DataFrame({"Variable": features, "Importancia": importancias})
+    # Una vez validada la robustez, entrenamos el modelo FINAL con todo el dataset
+    modelo.fit(X, y)
+
+    # ==========================================
+    # EL TABLERO DE CONTROL CUANTITATIVO
+    # ==========================================
+    print(f"   📊 REPORTE DEL CEREBRO MOMENTUM: {par1} vs {par2}")
+    print("   " + "="*50)
+    
+    prec_media = np.mean(precisiones_historicas) * 100 if precisiones_historicas else 0
+    print(f"   🛡️ Precisión Real Esperada (Walk-Forward): {prec_media:.1f}%")
+    
+    if prec_media < 55:
+        print("   ⚠️ ADVERTENCIA: Este modelo tiene una ventaja estadística pobre en el tiempo.")
+
+    print("\n   🕵️‍♂️ TOP 5 VARIABLES CLAVE:")
+    pesos = pd.DataFrame({"Variable": features, "Importancia": modelo.feature_importances_})
     pesos = pesos.sort_values(by="Importancia", ascending=False)
     
-    for _, fila in pesos.head(3).iterrows():
+    for _, fila in pesos.head(5).iterrows():
         print(f"      -> {fila['Variable']}: {fila['Importancia']*100:.1f}%")
         
-    print("   " + "="*45)
+    print("   " + "="*50)
 
     ruta_salida = f"Data_Lake/Modelos_IA/Cerebro_{par1}_{par2}.pkl"
     joblib.dump(modelo, ruta_salida)
     
-    return precision_global
+    return prec_media

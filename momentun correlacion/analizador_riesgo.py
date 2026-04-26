@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-from fusionador_ml import fusionar_bases_de_datos # ⚡ Importamos los datos directos en RAM
+from fusionador_ml import fusionar_bases_de_datos 
 
 PARES_ACTIVOS = [
     ("GBPUSD", "USDCAD"),
@@ -11,61 +11,85 @@ PARES_ACTIVOS = [
     ("AUDUSD", "USDCAD")
 ]
 
-VELAS_FUTURO = 24
+VELAS_FUTURO = 48
+GANANCIA_MINIMA_ATR = 1.0 # Solo medimos el dolor de las operaciones que ganaron al menos 1 ATR
 
-def analizar_riesgo():
-    print("🔍 INICIANDO ANÁLISIS CUANTITATIVO DE RIESGO (MAE / MFE)\n")
+def analizar_riesgo_momentum():
+    print("🔍 INICIANDO PERFILADO DE RIESGO INSTITUCIONAL (MAE / MFE en ATR)\n")
     
+    riesgo_optimo = {}
+
     for par1, par2 in PARES_ACTIVOS:
         print(f"⚙️ Procesando histórico en memoria para {par1} vs {par2}...")
-        
-        # Generamos el dataset en vivo sin usar archivos CSV
         df = fusionar_bases_de_datos(par1, par2)
         
         if df is None or df.empty:
-            print(f"   ❌ No se pudieron fusionar los datos.\n")
+            print(f"   ❌ No se pudieron fusionar los datos.")
             continue
             
-        # Reiniciamos índice por seguridad
         df.reset_index(drop=True, inplace=True)
         
-        excursiones_adversas = []
-        excursiones_favorables = []
-        
-        for i in range(len(df) - VELAS_FUTURO):
-            spread_actual = df.loc[i, 'spread_total']
+        # Evaluamos el riesgo de cada moneda de forma independiente
+        for moneda in [par1, par2]:
+            col_gatillo = f'gatillo_pullback_{moneda}'
+            col_atr = f'ATRr_14_{moneda}'
+            col_close = f'close_{moneda}'
+            col_high = f'high_{moneda}'
+            col_low = f'low_{moneda}'
             
-            if abs(spread_actual) > 1.5:
-                ventana = df.loc[i:i+VELAS_FUTURO, 'spread_total']
+            # Filtro de seguridad
+            if col_gatillo not in df.columns:
+                continue
                 
-                if spread_actual > 1.5:
-                    max_adverso = ventana.max() - spread_actual 
-                    max_favorable = spread_actual - ventana.min() 
-                else:
-                    max_adverso = spread_actual - ventana.min() 
-                    max_favorable = ventana.max() - spread_actual 
-                
-                if max_favorable > 1.0: 
-                    excursiones_adversas.append(max_adverso)
-                    excursiones_favorables.append(max_favorable)
-
-        if len(excursiones_adversas) == 0:
-            print("   ⚠️ No hay suficientes datos de victorias.\n")
-            continue
+            # Extraemos SOLO las filas donde el escáner ordenó disparar
+            entradas = df[df[col_gatillo] != 0].index
             
-        # El 95% de nuestras victorias NUNCA sufrieron más que este dolor
-        sl_optimo = np.percentile(excursiones_adversas, 95)
-        # El 50% de las veces, el precio llegó fácil hasta esta ganancia
-        tp_optimo = np.percentile(excursiones_favorables, 50)
+            mae_list = [] # Maximum Adverse Excursion (Dolor soportado en ATR)
+            mfe_list = [] # Maximum Favorable Excursion (Ganancia máxima en ATR)
+            
+            for i in entradas:
+                if i + VELAS_FUTURO >= len(df): continue
+                
+                gatillo = df.loc[i, col_gatillo]
+                precio = df.loc[i, col_close]
+                atr = df.loc[i, col_atr]
+                
+                if atr == 0 or pd.isna(atr): continue
+                
+                # Proyección a futuro
+                futuro_high = df.loc[i+1 : i+VELAS_FUTURO, col_high]
+                futuro_low = df.loc[i+1 : i+VELAS_FUTURO, col_low]
+                
+                # Cálculo de recorrido crudo
+                if gatillo == 1: # LONG
+                    mfe = (futuro_high.max() - precio) / atr
+                    mae = (precio - futuro_low.min()) / atr
+                else: # SHORT
+                    mfe = (precio - futuro_low.min()) / atr
+                    mae = (futuro_high.max() - precio) / atr
+                    
+                mfe_list.append(mfe)
+                
+                # Filtro MAE: Solo guardamos el retroceso de las operaciones que terminaron ganando
+                if mfe >= GANANCIA_MINIMA_ATR:
+                    mae_list.append(mae)
+                    
+            if len(mae_list) < 30:
+                print(f"   ⚠️ {moneda}: Pocos datos de victorias claras ({len(mae_list)}).")
+            else:
+                # El 95% de las VICTORIAS no retrocedió más que este nivel
+                sl_atr = np.percentile(mae_list, 95) 
+                # El 50% de las operaciones alcanzaron al menos este profit
+                tp_atr = np.percentile(mfe_list, 50)
+                
+                print(f"   📊 {moneda}: {len(mae_list)} victorias analizadas.")
+                print(f"      🛡️ SL Óptimo: {sl_atr:.2f} ATR")
+                print(f"      🎯 TP Óptimo: {tp_atr:.2f} ATR")
+                
+                riesgo_optimo[moneda] = {"sl_atr": round(sl_atr, 2), "tp_atr": round(tp_atr, 2)}
+        print("   -------------------------------------------------")
         
-        multiplicador_sl = sl_optimo / 2.0
-        multiplicador_tp = tp_optimo / 2.0
-        
-        print(f"📊 REPORTE DE RIESGO: {par1} vs {par2}")
-        print(f"   📈 Victorias analizadas: {len(excursiones_adversas)} escenarios reales")
-        print(f"   🛡️ Stop Loss Ideal  : {multiplicador_sl:.2f} * std_dev")
-        print(f"   🎯 Take Profit Ideal: {multiplicador_tp:.2f} * std_dev")
-        print("   -------------------------------------------------\n")
+    return riesgo_optimo
 
 if __name__ == "__main__":
-    analizar_riesgo()
+    analizar_riesgo_momentum()
