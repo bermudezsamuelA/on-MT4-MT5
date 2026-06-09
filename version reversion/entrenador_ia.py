@@ -1,6 +1,6 @@
 import pandas as pd
 from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestClassifier
+from xgboost import XGBClassifier
 from sklearn.metrics import accuracy_score, classification_report 
 import joblib
 import os
@@ -9,13 +9,11 @@ def entrenar_modelo(df_entrenamiento, par1, par2):
     if not os.path.exists("Data_Lake/Modelos_IA"):
         os.makedirs("Data_Lake/Modelos_IA")
 
-    # 1. PURGA DE DATOS: Solo usamos Estadística y Momentum puro
+    # 1. PURGA DE DATOS
     columnas_z_score = [col for col in df_entrenamiento.columns if 'z_score' in col]
     columnas_rsi = [col for col in df_entrenamiento.columns if 'RSI' in col]
     
-    # ❌ Eliminamos las zonas K-Means para evitar el error del 0.0 en vivo
     features = ['spread_total'] + columnas_z_score + columnas_rsi
-    
     df_limpio = df_entrenamiento.dropna(subset=features).copy()
     
     if len(df_limpio) < 200:
@@ -25,20 +23,26 @@ def entrenar_modelo(df_entrenamiento, par1, par2):
     X = df_limpio[features]
     y = df_limpio['target_exito']
 
-    # Respetamos el orden temporal (Time Series) para evitar mirar al futuro
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, shuffle=False)
 
-    # Bosque Aleatorio optimizado para Reversión
-    modelo = RandomForestClassifier(n_estimators=200, max_depth=10, random_state=42, class_weight='balanced')
+    # 🧠 FASE 3: XGBoost (Gradient Boosting)
+    # Calculamos el desbalance exacto para que la IA preste atención a las minorías
+    ratio_clases = (len(y_train) - sum(y_train)) / sum(y_train) if sum(y_train) > 0 else 1
+    
+    modelo = XGBClassifier(
+        n_estimators=300, 
+        max_depth=6, 
+        learning_rate=0.05, 
+        random_state=42, 
+        scale_pos_weight=ratio_clases,
+        eval_metric='logloss'
+    )
     modelo.fit(X_train, y_train)
 
     predicciones = modelo.predict(X_test)
     precision_global = accuracy_score(y_test, predicciones) * 100
 
-    # ==========================================
-    # EL TABLERO DE CONTROL 
-    # ==========================================
-    print(f"\n   📊 REPORTE DEL CEREBRO (REVERSIÓN): {par1} vs {par2}")
+    print(f"\n   📊 REPORTE DEL CEREBRO XGBOOST (REVERSIÓN): {par1} vs {par2}")
     print("   " + "="*45)
     
     reporte = classification_report(y_test, predicciones, target_names=["Divergencia (0)", "Reversión (1)"])
