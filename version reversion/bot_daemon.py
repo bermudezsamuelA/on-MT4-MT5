@@ -13,8 +13,8 @@ from semaforo_cuantitativo import consultar_semaforo
 # ==========================================
 # CONFIGURACIÓN DEL DAEMON HÍBRIDO (FASE 2)
 # ==========================================
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8668581533:AAHjwwdTZ6Tylq8_w8dz-MqGySPUlIhyb3k")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "1133179366")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "*****")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "*****")
 
 PARES_ACTIVOS = [
     ("GBPUSD", "USDCAD"), ("GBPUSD", "USDCHF"),
